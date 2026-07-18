@@ -19,6 +19,7 @@ package org.apache.spark.sql.execution
 
 import scala.util.Random
 
+import org.apache.spark.SparkException
 import org.apache.spark.rdd.{DeterministicLevel, RDD}
 import org.apache.spark.sql.{Dataset, Row}
 import org.apache.spark.sql.catalyst.InternalRow
@@ -26,6 +27,7 @@ import org.apache.spark.sql.catalyst.expressions.{Alias, Literal}
 import org.apache.spark.sql.catalyst.plans.physical.{HashPartitioning, IdentityBroadcastMode, NullAwareHashPartitioning, SinglePartition}
 import org.apache.spark.sql.execution.exchange.{BroadcastExchangeExec, Exchange, ReusedExchangeExec, ShuffleExchangeExec}
 import org.apache.spark.sql.execution.joins.HashedRelationBroadcastMode
+import org.apache.spark.sql.functions.broadcast
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.test.SharedSparkSession
 import org.apache.spark.sql.vectorized.ColumnarBatch
@@ -47,6 +49,34 @@ case class ColumnarExchange(child: SparkPlan) extends Exchange {
 
 class ExchangeSuite extends SharedSparkSession {
   import testImplicits._
+
+  test("SPARK-17556: build broadcast join relation on executors") {
+    withSQLConf(SQLConf.EXECUTOR_SIDE_BROADCAST_ENABLED.key -> "true") {
+      val left = Seq((1, "one"), (2, "two")).toDF("key", "leftValue")
+      val right = Seq((1, "uno"), (3, "tres")).toDF("key", "rightValue")
+
+      checkAnswer(
+        left.join(broadcast(right), "key"),
+        Row(1, "one", "uno"))
+
+      checkAnswer(
+        left.join(broadcast(right), left("key") < right("key")),
+        Row(1, "one", 3, "tres") :: Row(2, "two", 3, "tres") :: Nil)
+    }
+  }
+
+  test("SPARK-17556: enforce executor-side broadcast size limit") {
+    withSQLConf(
+        SQLConf.EXECUTOR_SIDE_BROADCAST_ENABLED.key -> "true",
+        SQLConf.MAX_BROADCAST_TABLE_SIZE.key -> "1") {
+      val error = intercept[SparkException] {
+        Seq(Tuple1(1)).toDF("key")
+          .join(broadcast(Seq((1, "one")).toDF("key", "value")), "key")
+          .collect()
+      }
+      assert(error.getCondition == "_LEGACY_ERROR_TEMP_2249")
+    }
+  }
 
   setupTestData()
 

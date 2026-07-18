@@ -37,6 +37,7 @@ import org.apache.spark.sql.execution.joins.{HashedRelation, HashedRelationBroad
 import org.apache.spark.sql.execution.metric.SQLMetrics
 import org.apache.spark.sql.internal.{SQLConf, StaticSQLConf}
 import org.apache.spark.sql.types.LongType
+import org.apache.spark.storage.StorageLevel
 import org.apache.spark.unsafe.map.BytesToBytesMap
 import org.apache.spark.util.{SparkFatalException, ThreadUtils}
 
@@ -173,6 +174,46 @@ case class BroadcastExchangeExec(
     case _ => 512000000
   }
 
+  @transient private var executorBroadcastInput: RDD[InternalRow] = _
+
+  private def buildOnExecutors(): broadcast.Broadcast[Any] = {
+    val beforeMaterialize = System.nanoTime()
+    executorBroadcastInput = child.execute().mapPartitionsInternal(_.map(_.copy()))
+      .persist(StorageLevel.MEMORY_AND_DISK_SER)
+    val numRows = executorBroadcastInput.count()
+    longMetric("numOutputRows") += numRows
+    if (numRows >= maxBroadcastRows) {
+      executorBroadcastInput.unpersist()
+      throw QueryExecutionErrors.cannotBroadcastTableOverMaxTableRowsError(
+        maxBroadcastRows, numRows)
+    }
+    longMetric("collectTime") += NANOSECONDS.toMillis(System.nanoTime() - beforeMaterialize)
+    val beforeBuild = System.nanoTime()
+    val broadcastMode = mode
+    val maxBroadcastTableSizeInBytes = conf.maxBroadcastTableSizeInBytes
+    val (broadcasted, dataSize) = sparkContext.broadcastOnExecutors[InternalRow, Any](
+      executorBroadcastInput,
+      rows => broadcastMode.transform(rows, Some(numRows)),
+      { relation =>
+        val size = relation match {
+          case map: HashedRelation => map.estimatedSize
+          case arr: Array[InternalRow] =>
+            arr.iterator.map(_.asInstanceOf[UnsafeRow].getSizeInBytes.toLong).sum
+          case other =>
+            throw new SparkException("[BUG] BroadcastMode.transform returned unexpected " +
+              s"type: ${other.getClass.getName}")
+        }
+        if (size >= maxBroadcastTableSizeInBytes) {
+          throw QueryExecutionErrors.cannotBroadcastTableOverMaxTableBytesError(
+            maxBroadcastTableSizeInBytes, size)
+        }
+        size
+      })
+    longMetric("dataSize") += dataSize
+    longMetric("buildTime") += NANOSECONDS.toMillis(System.nanoTime() - beforeBuild)
+    broadcasted
+  }
+
   @transient
   override lazy val relationFuture: Future[broadcast.Broadcast[Any]] = {
     SQLExecution.withThreadLocalCaptured[broadcast.Broadcast[Any]](
@@ -181,49 +222,57 @@ case class BroadcastExchangeExec(
             // Setup a job tag here so later it may get cancelled by tag if necessary.
             sparkContext.addJobTag(jobTag)
             sparkContext.setInterruptOnCancel(true)
-            val beforeCollect = System.nanoTime()
-            // Use executeCollect/executeCollectIterator to avoid conversion to Scala types
-            val (numRows, input) = child.executeCollectIterator()
-            longMetric("numOutputRows") += numRows
-            if (numRows >= maxBroadcastRows) {
-              throw QueryExecutionErrors.cannotBroadcastTableOverMaxTableRowsError(
-                maxBroadcastRows, numRows)
+            if (conf.executorSideBroadcastEnabled) {
+              val broadcasted = buildOnExecutors()
+              val executionId = sparkContext.getLocalProperty(SQLExecution.EXECUTION_ID_KEY)
+              SQLMetrics.postDriverMetricUpdates(sparkContext, executionId, metrics.values.toSeq)
+              promise.trySuccess(broadcasted)
+              broadcasted
+            } else {
+              val beforeCollect = System.nanoTime()
+              // Use executeCollect/executeCollectIterator to avoid conversion to Scala types
+              val (numRows, input) = child.executeCollectIterator()
+              longMetric("numOutputRows") += numRows
+              if (numRows >= maxBroadcastRows) {
+                throw QueryExecutionErrors.cannotBroadcastTableOverMaxTableRowsError(
+                  maxBroadcastRows, numRows)
+              }
+
+              val beforeBuild = System.nanoTime()
+              longMetric("collectTime") += NANOSECONDS.toMillis(beforeBuild - beforeCollect)
+
+              // Construct the relation.
+              val relation = mode.transform(input, Some(numRows))
+
+              val dataSize = relation match {
+                case map: HashedRelation =>
+                  map.estimatedSize
+                case arr: Array[InternalRow] =>
+                  arr.map(_.asInstanceOf[UnsafeRow].getSizeInBytes.toLong).sum
+                case _ =>
+                  throw new SparkException("[BUG] BroadcastMode.transform returned unexpected " +
+                    s"type: ${relation.getClass.getName}")
+              }
+
+              longMetric("dataSize") += dataSize
+              val maxBroadcastTableSizeInBytes = conf.maxBroadcastTableSizeInBytes
+              if (dataSize >= maxBroadcastTableSizeInBytes) {
+                throw QueryExecutionErrors.cannotBroadcastTableOverMaxTableBytesError(
+                  maxBroadcastTableSizeInBytes, dataSize)
+              }
+
+              val beforeBroadcast = System.nanoTime()
+              longMetric("buildTime") += NANOSECONDS.toMillis(beforeBroadcast - beforeBuild)
+
+              // SPARK-39983 - Broadcast the relation without caching the unserialized object.
+              val broadcasted = sparkContext.broadcastInternal(relation, serializedOnly = true)
+              longMetric("broadcastTime") += NANOSECONDS.toMillis(
+                System.nanoTime() - beforeBroadcast)
+              val executionId = sparkContext.getLocalProperty(SQLExecution.EXECUTION_ID_KEY)
+              SQLMetrics.postDriverMetricUpdates(sparkContext, executionId, metrics.values.toSeq)
+              promise.trySuccess(broadcasted)
+              broadcasted
             }
-
-            val beforeBuild = System.nanoTime()
-            longMetric("collectTime") += NANOSECONDS.toMillis(beforeBuild - beforeCollect)
-
-            // Construct the relation.
-            val relation = mode.transform(input, Some(numRows))
-
-            val dataSize = relation match {
-              case map: HashedRelation =>
-                map.estimatedSize
-              case arr: Array[InternalRow] =>
-                arr.map(_.asInstanceOf[UnsafeRow].getSizeInBytes.toLong).sum
-              case _ =>
-                throw new SparkException("[BUG] BroadcastMode.transform returned unexpected " +
-                  s"type: ${relation.getClass.getName}")
-            }
-
-            longMetric("dataSize") += dataSize
-            val maxBroadcastTableSizeInBytes = conf.maxBroadcastTableSizeInBytes
-            if (dataSize >= maxBroadcastTableSizeInBytes) {
-              throw QueryExecutionErrors.cannotBroadcastTableOverMaxTableBytesError(
-                maxBroadcastTableSizeInBytes, dataSize)
-            }
-
-            val beforeBroadcast = System.nanoTime()
-            longMetric("buildTime") += NANOSECONDS.toMillis(beforeBroadcast - beforeBuild)
-
-            // SPARK-39983 - Broadcast the relation without caching the unserialized object.
-            val broadcasted = sparkContext.broadcastInternal(relation, serializedOnly = true)
-            longMetric("broadcastTime") += NANOSECONDS.toMillis(
-              System.nanoTime() - beforeBroadcast)
-            val executionId = sparkContext.getLocalProperty(SQLExecution.EXECUTION_ID_KEY)
-            SQLMetrics.postDriverMetricUpdates(sparkContext, executionId, metrics.values.toSeq)
-            promise.trySuccess(broadcasted)
-            broadcasted
           } catch {
             // SPARK-24294: To bypass scala bug: https://github.com/scala/bug/issues/9554, we throw
             // SparkFatalException, which is a subclass of Exception. ThreadUtils.awaitResult

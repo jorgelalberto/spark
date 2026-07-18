@@ -2105,6 +2105,15 @@ object SQLConf {
     .timeConf(TimeUnit.SECONDS)
     .createWithDefaultString(s"${5 * 60}")
 
+  val EXECUTOR_SIDE_BROADCAST_ENABLED =
+    buildConf("spark.sql.execution.executorSideBroadcast.enabled")
+      .internal()
+      .doc("When true, broadcast exchanges build their relation from persisted RDD blocks on " +
+        "executors instead of collecting the input on the driver.")
+      .version("4.2.0")
+      .booleanConf
+      .createWithDefault(false)
+
   val MAX_BROADCAST_TABLE_SIZE = buildConf("spark.sql.maxBroadcastTableSize")
     .doc("The maximum table size in bytes that can be broadcast in broadcast joins.")
     .version("4.1.0")
@@ -8625,6 +8634,8 @@ class SQLConf extends Serializable with Logging with SqlApiConf {
   }
 
   def maxBroadcastTableSizeInBytes: Long = getConf(MAX_BROADCAST_TABLE_SIZE)
+
+  def executorSideBroadcastEnabled: Boolean = getConf(EXECUTOR_SIDE_BROADCAST_ENABLED)
 
   def defaultDataSourceName: String = getConf(DEFAULT_DATA_SOURCE_NAME)
 

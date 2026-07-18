@@ -20,6 +20,7 @@ package org.apache.spark.broadcast
 import scala.reflect.ClassTag
 
 import org.apache.spark.SparkConf
+import org.apache.spark.rdd.RDD
 
 /**
  * An interface for all the broadcast implementations in Spark (to allow
@@ -44,6 +45,9 @@ private[spark] trait BroadcastFactory {
       isLocal: Boolean,
       id: Long,
       serializedOnly: Boolean = false): Broadcast[T]
+
+  def newBroadcastOnExecutors[T: ClassTag, U: ClassTag](
+      rdd: RDD[T], transform: Iterator[T] => U, id: Long): Broadcast[U]
 
   def unbroadcast(id: Long, removeFromDriver: Boolean, blocking: Boolean): Unit
 

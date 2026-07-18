@@ -78,6 +78,11 @@ private[spark] class BroadcastManager(
     broadcastFactory.newBroadcast[T](value_, isLocal, bid, serializedOnly)
   }
 
+  def newBroadcastOnExecutors[T: ClassTag, U: ClassTag](
+      rdd: org.apache.spark.rdd.RDD[T], transform: Iterator[T] => U): Broadcast[U] = {
+    broadcastFactory.newBroadcastOnExecutors(rdd, transform, nextBroadcastId.getAndIncrement())
+  }
+
   def unbroadcast(id: Long, removeFromDriver: Boolean, blocking: Boolean): Unit = {
     broadcastFactory.unbroadcast(id, removeFromDriver, blocking)
   }

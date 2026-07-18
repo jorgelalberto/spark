@@ -174,7 +174,8 @@ case class BroadcastHashJoinExec private(
       // For inner and outer joins, one row from the streamed side may produce multiple result rows,
       // if the build side has duplicated keys. Note that here we wait for the broadcast to be
       // finished, which is a no-op because it's already finished when we wait it in `doProduce`.
-      !buildPlan.executeBroadcast[HashedRelation]().value.keyIsUnique
+      conf.executorSideBroadcastEnabled ||
+        !buildPlan.executeBroadcast[HashedRelation]().value.keyIsUnique
 
     // Other joins types(semi, anti, existence) can at most produce one result row for one input
     // row from the streamed side.
@@ -185,6 +186,8 @@ case class BroadcastHashJoinExec private(
   // this join plan only needs to copy result if it may output multiple rows for one input.
   override def needCopyResult: Boolean =
     streamedPlan.asInstanceOf[CodegenSupport].needCopyResult || multipleOutputForOneInput
+
+  override def supportCodegen: Boolean = !conf.executorSideBroadcastEnabled
 
   /**
    * Returns a tuple of Broadcast of HashedRelation and the variable name for it.
