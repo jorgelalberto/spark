@@ -190,8 +190,26 @@ case class BroadcastExchangeExec(
     longMetric("collectTime") += NANOSECONDS.toMillis(System.nanoTime() - beforeMaterialize)
     val beforeBuild = System.nanoTime()
     val broadcastMode = mode
-    val broadcasted = sparkContext.broadcastOnExecutors[InternalRow, Any](
-      executorBroadcastInput, rows => broadcastMode.transform(rows, Some(numRows)))
+    val maxBroadcastTableSizeInBytes = conf.maxBroadcastTableSizeInBytes
+    val (broadcasted, dataSize) = sparkContext.broadcastOnExecutors[InternalRow, Any](
+      executorBroadcastInput,
+      rows => broadcastMode.transform(rows, Some(numRows)),
+      { relation =>
+        val size = relation match {
+          case map: HashedRelation => map.estimatedSize
+          case arr: Array[InternalRow] =>
+            arr.iterator.map(_.asInstanceOf[UnsafeRow].getSizeInBytes.toLong).sum
+          case other =>
+            throw new SparkException("[BUG] BroadcastMode.transform returned unexpected " +
+              s"type: ${other.getClass.getName}")
+        }
+        if (size >= maxBroadcastTableSizeInBytes) {
+          throw QueryExecutionErrors.cannotBroadcastTableOverMaxTableBytesError(
+            maxBroadcastTableSizeInBytes, size)
+        }
+        size
+      })
+    longMetric("dataSize") += dataSize
     longMetric("buildTime") += NANOSECONDS.toMillis(System.nanoTime() - beforeBuild)
     broadcasted
   }

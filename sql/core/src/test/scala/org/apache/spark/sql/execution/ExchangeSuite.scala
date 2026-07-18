@@ -19,6 +19,7 @@ package org.apache.spark.sql.execution
 
 import scala.util.Random
 
+import org.apache.spark.SparkException
 import org.apache.spark.rdd.{DeterministicLevel, RDD}
 import org.apache.spark.sql.{Dataset, Row}
 import org.apache.spark.sql.catalyst.InternalRow
@@ -57,6 +58,23 @@ class ExchangeSuite extends SharedSparkSession {
       checkAnswer(
         left.join(broadcast(right), "key"),
         Row(1, "one", "uno"))
+
+      checkAnswer(
+        left.join(broadcast(right), left("key") < right("key")),
+        Row(1, "one", 3, "tres") :: Row(2, "two", 3, "tres") :: Nil)
+    }
+  }
+
+  test("SPARK-17556: enforce executor-side broadcast size limit") {
+    withSQLConf(
+        SQLConf.EXECUTOR_SIDE_BROADCAST_ENABLED.key -> "true",
+        SQLConf.MAX_BROADCAST_TABLE_SIZE.key -> "1") {
+      val error = intercept[SparkException] {
+        Seq(Tuple1(1)).toDF("key")
+          .join(broadcast(Seq((1, "one")).toDF("key", "value")), "key")
+          .collect()
+      }
+      assert(error.getCondition == "_LEGACY_ERROR_TEMP_2249")
     }
   }
 

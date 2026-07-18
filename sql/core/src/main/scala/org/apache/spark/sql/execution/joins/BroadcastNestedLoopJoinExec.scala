@@ -426,11 +426,12 @@ case class BroadcastNestedLoopJoinExec(
     }
   }
 
-  override def supportCodegen: Boolean = (joinType, buildSide) match {
-    case (_: InnerLike, _) | (LeftOuter, BuildRight) | (RightOuter, BuildLeft) |
-         (LeftSemi | LeftAnti, BuildRight) | (LeftSingle, BuildRight) => true
-    case _ => false
-  }
+  override def supportCodegen: Boolean = !conf.executorSideBroadcastEnabled &&
+    ((joinType, buildSide) match {
+      case (_: InnerLike, _) | (LeftOuter, BuildRight) | (RightOuter, BuildLeft) |
+           (LeftSemi | LeftAnti, BuildRight) | (LeftSingle, BuildRight) => true
+      case _ => false
+    })
 
   override def inputRDDs(): Seq[RDD[InternalRow]] = {
     streamed.asInstanceOf[CodegenSupport].inputRDDs()

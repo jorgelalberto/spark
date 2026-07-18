@@ -26,7 +26,7 @@ import org.apache.spark.{SparkEnv, SparkException, TaskContext}
 import org.apache.spark.internal.Logging
 import org.apache.spark.rdd.RDD
 import org.apache.spark.storage.{BlockId, BroadcastBlockId, RDDBlockId, StorageLevel}
-import org.apache.spark.util.Utils
+import org.apache.spark.util.{KeyLock, Utils}
 
 /** A broadcast whose value is assembled from persisted RDD blocks on each executor. */
 private[spark] class TorrentExecutorBroadcast[T: ClassTag, U: ClassTag](
@@ -39,11 +39,15 @@ private[spark] class TorrentExecutorBroadcast[T: ClassTag, U: ClassTag](
   private val broadcastId = BroadcastBlockId(id)
   @transient private lazy val _value = readBroadcastBlock()
 
-  override protected def getValue(): U = _value
+  override protected def getValue(): U = {
+    require(TaskContext.get() != null,
+      "Executor-side broadcast values cannot be materialized on the driver")
+    _value
+  }
 
-  private def readBroadcastBlock(): U = TorrentBroadcast.synchronized {
+  private def readBroadcastBlock(): U = TorrentExecutorBroadcast.lock.withLock(broadcastId) {
     val blockManager = SparkEnv.get.blockManager
-    blockManager.getLocalValues(broadcastId) match {
+    blockManager.getLocalValues(broadcastId).orElse(blockManager.get[U](broadcastId)) match {
       case Some(result) if result.data.hasNext =>
         val value = result.data.next().asInstanceOf[U]
         releaseLock(broadcastId)
@@ -58,7 +62,7 @@ private[spark] class TorrentExecutorBroadcast[T: ClassTag, U: ClassTag](
         }
         val value = transform(blocks.iterator.flatten)
         if (!blockManager.putSingle(
-            broadcastId, value, StorageLevel.MEMORY_AND_DISK, tellMaster = false)) {
+            broadcastId, value, StorageLevel.MEMORY_AND_DISK, tellMaster = true)) {
           throw new SparkException(s"Failed to store $broadcastId")
         }
         value
@@ -81,4 +85,8 @@ private[spark] class TorrentExecutorBroadcast[T: ClassTag, U: ClassTag](
     assertValid()
     out.defaultWriteObject()
   }
+}
+
+private object TorrentExecutorBroadcast {
+  private val lock = new KeyLock[BroadcastBlockId]
 }
