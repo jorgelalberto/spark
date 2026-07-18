@@ -1744,6 +1744,20 @@ class SparkContext(config: SparkConf) extends Logging {
     bc
   }
 
+  private[spark] def broadcastOnExecutors[T: ClassTag, U: ClassTag](
+      rdd: RDD[T], transform: Iterator[T] => U): Broadcast[U] = {
+    assertNotStopped()
+    require(rdd.getStorageLevel != StorageLevel.NONE,
+      "An executor-side broadcast must be persisted before it is materialized.")
+    val bc = env.broadcastManager.newBroadcastOnExecutors(rdd, transform)
+    rdd.mapPartitionsInternal { _ =>
+      bc.value
+      Iterator.empty[U]
+    }.count()
+    cleaner.foreach(_.registerBroadcastForCleanup(bc))
+    bc
+  }
+
   /**
    * Add a file to be downloaded with this Spark job on every node.
    *

@@ -26,6 +26,7 @@ import org.apache.spark.sql.catalyst.expressions.{Alias, Literal}
 import org.apache.spark.sql.catalyst.plans.physical.{HashPartitioning, IdentityBroadcastMode, NullAwareHashPartitioning, SinglePartition}
 import org.apache.spark.sql.execution.exchange.{BroadcastExchangeExec, Exchange, ReusedExchangeExec, ShuffleExchangeExec}
 import org.apache.spark.sql.execution.joins.HashedRelationBroadcastMode
+import org.apache.spark.sql.functions.broadcast
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.test.SharedSparkSession
 import org.apache.spark.sql.vectorized.ColumnarBatch
@@ -47,6 +48,17 @@ case class ColumnarExchange(child: SparkPlan) extends Exchange {
 
 class ExchangeSuite extends SharedSparkSession {
   import testImplicits._
+
+  test("SPARK-17556: build broadcast join relation on executors") {
+    withSQLConf(SQLConf.EXECUTOR_SIDE_BROADCAST_ENABLED.key -> "true") {
+      val left = Seq((1, "one"), (2, "two")).toDF("key", "leftValue")
+      val right = Seq((1, "uno"), (3, "tres")).toDF("key", "rightValue")
+
+      checkAnswer(
+        left.join(broadcast(right), "key"),
+        Row(1, "one", "uno"))
+    }
+  }
 
   setupTestData()
 
